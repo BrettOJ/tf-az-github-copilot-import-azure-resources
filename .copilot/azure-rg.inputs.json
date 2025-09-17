@@ -1,11 +1,13 @@
 {
+  "resource_group_name": "rg-boj-test-001",
   "subscription_id": "95328200-66a3-438f-9641-aeeb101e5e37",
-  "resource_group": "rg-boj-test-001",
-  "target_path": "infra/rg-boj-test-001",
+  "output_directory": "infra/rg-boj-test-001",
+  "include_resources": true,
+  "exclude_resources": [],
+  "terraform_version": "1.12.2",
+  "azurerm_version": "~> 4.44.0",
   "providers_filter": ["Microsoft.Network", "Microsoft.Storage"],
   "prefer_avm": true,
-  "tf_required_version": ">= 1.9.7",
-  "azurerm_version": "~> 4.44.0",
   "location_fallback": "southeastasia",
   "name_prefix": "test"
 }
