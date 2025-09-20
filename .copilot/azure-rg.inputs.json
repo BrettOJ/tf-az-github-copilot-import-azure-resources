@@ -1,13 +1,7 @@
 {
-  "resource_group_name": "rg-boj-test-001",
-  "subscription_id": "95328200-66a3-438f-9641-aeeb101e5e37",
-  "output_directory": "infra/rg-boj-test-001",
-  "include_resources": true,
-  "exclude_resources": [],
-  "terraform_version": "1.12.2",
-  "azurerm_version": "~> 4.44.0",
-  "providers_filter": ["Microsoft.Network", "Microsoft.Storage"],
-  "prefer_avm": true,
-  "location_fallback": "southeastasia",
-  "name_prefix": "test"
+  "resourceGroup": "rg-boj-test-001",
+  "subscriptionId": "95328200-66a3-438f-9641-aeeb101e5e37",
+  "tenantId": "72f988bf-86f1-41af-91ab-2d7cd011db47",
+  "targetPath": "infra/rg-boj-test-001",
+  "location": "southeastasia"
 }

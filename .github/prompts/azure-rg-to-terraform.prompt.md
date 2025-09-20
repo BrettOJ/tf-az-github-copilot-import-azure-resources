@@ -1,128 +1,135 @@
+# Azure RG → Terraform (AVM‑first) — **Prompt**
+
+> **Run non‑interactively.** Execute all steps below without asking questions. Use the **Instructions** doc in this workspace for policy and constraints.
+**Use the instructions document in this repository under:** `.github\instructions\azure-rg-to-terraform.instructions.md` (required)
+
+## 0) Load Inputs
+
+1. Read `.copilot/azure-rg.inputs.json` from the workspace root.
+2. Extract:
+   - `subscriptionId`, `tenantId`, `resourceGroup`, `targetPath`
+   - discovery preferences
+   - terraform backend + provider config
+   - naming prefs
+3. Create the `<targetPath>` directory in memory (emit files only once at the end).
+
+If the file is missing or invalid JSON, **stop and emit** a single error README explaining the issue, but still scaffold a minimal Terraform with placeholders.
+
 ---
-mode: agent
-description: **EXECUTE NOW (single pass).** Scan ALL Azure resources (and sub-resources) in the given resource group using the Azure MCP server, then generate Terraform (AVM-first) **and** `imports.tf` with `to:` + `id:` for every discovered object. **Windows paths** only. **Do NOT create the resource group** in Terraform.
+
+## 1) Discover Azure Inventory (deterministic)
+
+Follow this order; use the **first available** surface. Record which one was used:
+
+1. **Azure Resource Graph (ARG)**: Query the `Resources` table filtered to the given resource group. Fetch columns: `id`, `name`, `type`, `location`, `kind`, `sku`, `tags`, `properties`. For each `id`, infer possible child collections (diagnostics, private endpoints, DNS records, networking sub‑resources).
+2. **ARM GET**: If ARG is not available, perform HTTP GET for each resource `id` to retrieve full JSON, then probe well‑known `child` endpoints (e.g., `providers/Microsoft.Network/virtualNetworks/<vnet>/subnets`, `.../privateEndpointConnections`, `.../diagnosticSettings`).
+3. **Azure Tools API** (VS Code): If exposed, traverse the subscription → RG and collect resources, then hydrate details using the tool’s get‑properties endpoint.
+4. **Workspace JSON**: If both 1–3 are unavailable, read and merge JSON documents from `discovery.workspaceJsonGlobs`.
+
+Normalize each resource to a common shape including `children`.
+
 ---
 
-# Azure RG → Terraform (ALL resources + subresources) — **DO, don’t plan**
+## 2) Plan Terraform Mapping
 
-[Rules & matrix](..\\instructions\\azure-rg-to-terraform.instructions.md)
+1. Build a mapping from Azure `type` (e.g., `Microsoft.Storage/storageAccounts`) to **AVM module** when official names are known; otherwise mark as provider fallback.
+2. Group resources by service area (networking, compute, data, app, identity).
+3. Determine inter‑resource references (e.g., subnet IDs, private endpoint targets, identity links). Prefer outputs/inputs over `depends_on`.
 
-## Non‑interactive contract
-- **Don’t ask questions. Don’t propose a plan. Execute now.**
-- **Never** create a folder named after this command. Write files **only** to `<target_path>`.
-- **Never** create `resource "azurerm_resource_group"`. The RG already exists; use `data.azurerm_resource_group.rg`.
-- **Windows paths** only (e.g., `infra\\rg-name`).
-- Use the **Create: <path> + fenced code block** pattern for every file.
+---
 
-## Inputs (resolve in this exact order)
-1) Inline `${input:...}` values below.  
-2) If any is `__auto__`, load **attached** `#file:.copilot/azure-rg.inputs.json`.  
-3) If still `__auto__`, accept a fenced ```json block in this message.  
-4) If still missing, compute defaults where noted; only `subscription_id` and `resource_group` are required — if missing, ask **once** and continue.
+## 3) Emit Terraform (single write phase)
 
-- **subscription_id**: ${input:subscription_id:__auto__}
-- **resource_group**: ${input:resource_group:__auto__}
-- **target_path**: ${input:target_path:__auto__}          <!-- default: infra\\<resource_group> -->
-- **providers_filter**: ${input:providers_filter:__auto__} <!-- default: [] = ALL -->
-- **prefer_avm**: ${input:prefer_avm:__auto__}             <!-- default: true -->
-- **tf_required_version**: ${input:tf_required_version:__auto__}   <!-- default: >= 1.5.0 -->
-- **azurerm_version**: ${input:azurerm_version:__auto__}           <!-- default: ~> 3.113 -->
-- **azapi_version**: ${input:azapi_version:__auto__}               <!-- default: ~> 1.13 -->
-- **location_fallback**: ${input:location_fallback:__auto__}
-- **name_prefix**: ${input:name_prefix:__auto__}
-- **include_subresources**: ${input:include_subresources:__auto__} <!-- default: true -->
-- **subresource_depth**: ${input:subresource_depth:__auto__}       <!-- default: all -->
-- **api_version_strategy**: ${input:api_version_strategy:__auto__} <!-- default: latest -->
+Create files under `<targetPath>` **using the exact “Create:” blocks**:
 
-**Echo once, then continue**: `inputs_source`, `subscription_id`, `resource_group`, `target_path`.
+1. **`providers.tf`**
+   - Pin `azurerm` (~> latest major), enable `features {}`.
+   - Provide `required_version` for Terraform (e.g., `>= 1.7.0`).
 
-## Enumerate EVERYTHING (parents + children)
-- Set subscription via MCP.
-- **Parents:** `az resource list -g <rg> --output json`.
-- **Children (BFS sweep):** For each parent, call the ARM list endpoints from the **Subresource Matrix** (VNets→Subnets, NSGs→Rules, RouteTables→Routes, NIC→IPConfigs, LB/AppGW children, Private DNS links/records, Storage containers/shares/queues/tables, AKS agent pools, VMSS instances). Add every child with its **full ARM id**.
-- Deduplicate by `id`. Build a normalized inventory: `{id, type, name, location, parent_id, properties}`.
+2. **`backend.tf`**
+   - If backend is provided in inputs, emit the `terraform { backend "azurerm" { … } }` stanza.
+   - Else emit a local backend with a README warning.
 
-## Full-settings capture (state replication mode)
-For every discovered object:
-1) Perform `GET <ARM ID>?api-version=<latest>` to fetch full resource JSON.
-2) Build TF from the **real settings**:
-   - If an official AVM covers the **parent** type: pass settings via the AVM’s inputs (children like subnets live in module collections).
-   - If the AVM lacks an input for a property, **preserve it via AzAPI**:
-     - Either a dedicated child `azapi_resource` expected by the AVM, or
-     - A root-level `azapi_resource` with:
-       - `type  = "<Namespace/Type@<apiVersion>"`
-       - `name  = "<safe-name>"`
-       - `parent_id = "<ARM parent id>"` (when applicable)
-       - `location = <from RG or resource>`
-       - `body = jsonencode(<ARM properties with unsupported fields kept>)`
-       - `lifecycle { ignore_changes = [body] }`
-3) Strip **computed/read-only** fields from arguments/bodies: `id`, `type`, `name` (if provided by module), `etag`, `resourceGuid`, `systemData`, `provisioningState`, timestamps, and provider `Computed` attributes.
-4) Emit an **import** with `id = "<ARM ID>"`:
-   - If in an AVM module, set `to = module.<mod>.<TYPE>.<NAME>[...]` **exactly as defined** by the AVM internals (use inventory from downloaded module `.tf` files).
-   - Else target the declared `azurerm_*` or `azapi_resource.*`.
+3. **`variables.tf`**
+   - `subscription_id`, `tenant_id`, `location`, naming vars (`prefix`, `environment`).
+   - Validations where useful.
+
+4. **`data.tf`**
+   - `data "azurerm_client_config" "current" {}`
+   - `data "azurerm_resource_group" "rg" { name = var.resource_group }` (+ define `variable "resource_group"`).
+
+5. **`main.tf`**
+   - For each discovered resource:
+     - If AVM exists → emit a **module** with inputs mapped from discovery JSON.
+     - Else → emit `azurerm_*` resources that best reflect the settings.
+   - Keep blocks grouped by service area with clear comments.
+
+6. **`imports.tf`**
+   - Emit an `import` block for **every** module/resource.
+   - For AVM, target the module’s internal resource address as documented (include a comment with the specific address mapping if non‑obvious).
+   - For provider resources, import by `id` → `azurerm_<type>.<name>`.
+
+7. **`outputs.tf`**
+   - Useful IDs, names, FQDNs, endpoints.
+
+8. **`README.md`**
+   - Discovery surface used and missing.
+   - Resource counts (AVM vs provider fallback).
+   - TODOs for sub‑settings that have no input in AVM today.
+   - How to run: `terraform init`, `terraform plan`, `terraform apply` (with caution) and `terraform import`.
 
 
-## AVM preference (official only)
-- Use **official AVM modules** only (Terraform Registry `Azure/avm-res-*`):
-  - `Microsoft.Network/virtualNetworks` → `Azure/avm-res-network-virtualnetwork/azurerm`
-  - `Microsoft.Storage/storageAccounts` → `Azure/avm-res-storage-storageaccount/azurerm`
-- If no official AVM exists for a type, use root‑level `azurerm_*`. Unknowns → `azapi_resource`.
+> **Do not** write files incrementally. Prepare content then emit all “Create:” blocks once, in the order above.
 
-## Pin AVM versions (deterministic & correct folder)
-1) Ensure <target_path> exists (create if missing).
-2) Run: terraform -chdir="<target_path>" init -upgrade -backend=false
-3) Read "<target_path>\.terraform\modules\modules.json". For each
-   entry whose Source starts with "registry.terraform.io/Azure/avm-res-",
-   set that exact "Version" back into "<target_path>\main.tf" for the
-   matching module (source = "Azure/avm-res-.../azurerm").
-4) Fail if any module still has version = "0.0.0-placeholder" or "1.0.0".
+---
 
+## 4) AVM Preference & Examples (inline hints)
 
-## AVM version pinning (must pin real latest)
-- When writing each AVM `module` block, set `version = "0.0.0-placeholder"` temporarily.
-- Immediately run `terraform -chdir="<target_path>" init -upgrade -backend=false` in `<target_path>` to fetch the **latest** official Azure AVM.
-- Read `.terraform\modules\modules.json` and, for each `registry.terraform.io/Azure/avm-res-*` entry, extract its `"Version"`.
-- Replace the placeholder in `main.tf` with the exact `"Version"` from `modules.json` for each module.
-- Append the pinned versions to `README.md` under **Pinned AVM versions**.
-- Fail if any AVM `version` remains unset or equals `1.0.0`. Never guess.
+When mapping, use **official AVM** names where known. Examples (non‑exhaustive):
 
-## Generate files (use **Create:** pattern)
-Create in `<target_path>` in this order:
+- **VNet & Subnets** → `Azure/avm-res-network-virtualnetwork`
+- **Public IP** → `Azure/avm-res-network-publicipaddress`
+- **Private DNS Zone** → `Azure/avm-res-privatedns-zone`
+- **Storage Account** → `Azure/avm-res-stor-storageaccount` (+ containers/shares via inputs or child modules)
+- **Key Vault** → `Azure/avm-res-keyvlt-vault`
 
-1) **versions.tf** — pin Terraform and providers.
-2) **providers.tf** — providers, `data.azurerm_resource_group.rg`, locals.
-3) **variables.tf** — `resource_group`, `name_prefix`, `location_fallback`.
-4) **main.tf** — for each inventory object:
-   - If AVM exists for its parent type, add/extend the proper AVM module with **just enough** inputs to match discovered state (children like subnets go in module inputs).
-   - Else declare root `azurerm_*` (or `azapi_resource`) to model the object.
-5) **imports.tf** — **one import per object**:
-   - If represented by an AVM module: `to = module.<mod>.<TYPE>.<NAME>[...]` (or nested) **as defined in that AVM’s code** (often `azapi_resource.*` for VNets).
-   - Else: `to = azurerm_*.<name>` (or `azapi_resource.<name>`).
-   - Always set `id = "<FULL ARM ID>"`.
-6) **outputs.tf** — useful names/ids.
-7) **README.md** — summary, pinned AVM versions, counts, and an Import Address Report.
+If uncertain whether an official AVM exists, **fallback immediately** to `azurerm_*` and add a TODO with a link placeholder to the AVM catalog.
 
-## AVM internal addresses (don’t guess)
-- After writing `main.tf`, assume `terraform -chdir="<target_path>" init -backend=false` to fetch modules (no prompt).
-- Build address inventory by reading module `.tf` files under `.terraform\\modules\\...`:
-  - `resource "<TYPE>" "<NAME>"` → addresses are `module.<mod>.<TYPE>.<NAME>` (or `["key"]` / nested `.module.<child>`).
-- If you can’t inspect the code, prefer **`azapi_resource.*`** addresses for the known AVMs above (vnet, storage account), and include a TODO to validate with `terraform validate`.
+---
 
-## AVM introspection (real module internals → import addresses)
-- After writing main.tf and pinning versions, assume terraform -chdir="<target_path>" init -backend=false has downloaded sources into ".terraform\modules\...".
-- Build an inventory by scanning those module .tf files for:
-  resource "<TYPE>" "<NAME>"
-- Construct imports **from this inventory** (do not guess):
-  - Root:   module.<mod>.<TYPE>.<NAME>
-  - for_each: module.<mod>.<TYPE>.<NAME>["<key>"]
-  - Nested submodule: module.<mod>.module.<child>["<key>"].<TYPE>.<NAME>
-- **Smart enforcement**:
-  - Allow module.*.azurerm_* only if it actually exists in the AVM code.
-  - If the AVM uses azapi_resource internally (e.g., vnet, subnet), rewrite any guessed azurerm_* target to the correct azapi_resource.* address.
+## 5) Import Blocks — Addressing Pattern
 
+- AVM example (comment):
+  ```hcl
+  # module.storage_account.azurerm_storage_account.this[0]
+  import {
+    to = module.storage_account.azurerm_storage_account.this[0]
+    id = "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<name>"
+  }
+  ```
 
-## Output
-- When done creating files, print: `DONE: <target_path>` and show a consolidated diff/patch of everything under `<target_path>` only.
-- After `terraform -chdir="<target_path>" init -upgrade -backend=false`, if any AVM module still shows `version = "0.0.0-placeholder"` or `1.0.0`, re-read `.terraform\modules\modules.json` and fix; if unresolved, stop with a clear error.
+- Provider example:
+  ```hcl
+  import {
+    to = azurerm_private_dns_zone.pdz
+    id = "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/privateDnsZones/<zone>"
+  }
+  ```
 
+Adjust addresses according to the module internals; include comments to guide the operator.
 
+---
+
+## 6) Determinism & Naming
+
+- Derive HCL resource names from Azure names sanitized to `[a-z0-9_]+` and prefixed by `var.prefix` where appropriate.
+- Sort blocks by `type/name` ascending for stable diffs.
+
+---
+
+## 7) Finalize
+
+- Emit the file set via **Create blocks** to `<targetPath>`.
+- If discovery used workarounds or AVM gaps exist, list them in `README.md`.
+
+> End of prompt. Execute now.
